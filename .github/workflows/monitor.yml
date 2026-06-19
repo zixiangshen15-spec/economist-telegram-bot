@@ -1,0 +1,46 @@
+name: 经济学人 Telegram 推送
+
+on:
+  schedule:
+    # 北京时间每周六早上 9:00 和每周日早上 9:00 (UTC+8)
+    # 经济学人通常周五/周六发布，双保险
+    - cron: '0 1 * * 6'
+    - cron: '0 1 * * 0'
+  workflow_dispatch:  # 允许手动触发
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # 需要写入权限来更新 last_issue.txt
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+
+      - name: 运行监控脚本
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+        run: python monitor.py
+
+      - name: 提交状态更新
+        if: success()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add last_issue.txt
+          if git diff --staged --quiet; then
+            echo "状态文件无变化"
+          else
+            git commit -m "update: last processed issue"
+            git push
+          fi
