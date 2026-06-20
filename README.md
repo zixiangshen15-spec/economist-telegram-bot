@@ -1,4 +1,4 @@
-# 经济学人 Telegram 自动推送频道
+# 经济学人每周 Telegram 自动推送更新
 
 每期《经济学人》出炉时，自动推送到 Telegram 频道，订阅者直接接收。
 
@@ -66,6 +66,7 @@ economist-telegram-bot/
 ├── monitor.py              # 核心脚本
 ├── requirements.txt        # Python 依赖
 ├── last_issue.txt          # 记录最后处理的期刊日期
+├── catalog_msg_ids.txt     # 记录置顶消息 ID
 ├── .github/workflows/
 │   └── monitor.yml         # GitHub Actions 定时任务配置
 └── README.md               # 本文件
