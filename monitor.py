@@ -194,6 +194,7 @@ def process_new_issue(issue):
             caption = (
                 f"📰 <b>The Economist</b>\n"
                 f"📅 <b>{date_str}</b>\n"
+                f"🔗 <a href=\"https://t.me/the_econimist_weekly\">订阅频道</a>\n"
                 f"---\n"
                 f"正在发送 PDF + EPUB + MOBI + AZW3..."
             )

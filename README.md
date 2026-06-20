@@ -1,69 +1,65 @@
-# 经济学人 Telegram 自动推送 Bot
+# 经济学人 Telegram 自动推送频道
 
-每期《经济学人》出炉时，自动推送到你的 Telegram 手机 App。
+每期《经济学人》出炉时，自动推送到 Telegram 频道，订阅者直接接收。
 
-## 工作原理
-
-```
-经济学人仓库更新 → GitHub Actions 定时检查 → 下载所有格式文件 → Telegram Bot 推送到你手机
-```
+👉 **订阅链接：https://t.me/the_econimist_weekly**
 
 ---
 
-## 🚀 一键部署（步骤）
+## 订阅方式（只需 1 步）
 
-### 第 1 步：创建 GitHub 仓库
+打开 https://t.me/the_econimist_weekly → 点 **加入频道** → 完事。
 
-1. 打开 https://github.com/new
-2. Repository name 填：`economist-telegram-bot`
-3. 选 **Private**（私密仓库）
-4. 不要勾选 "Add a README file"
-5. 点 **Create repository**
-
-### 第 2 步：上传代码
-
-创建仓库后页面会显示「Quick setup」，在电脑上打开终端，复制粘贴下面这些命令（把 `你的GitHub用户名` 替换成你实际的）：
-
-```bash
-cd ~/economist-telegram-bot
-
-git init
-git add .
-git commit -m "init: 经济学人 Telegram Bot"
-
-git remote add origin https://github.com/你的GitHub用户名/economist-telegram-bot.git
-git branch -M main
-git push -u origin main
-```
-
-### 第 3 步：设置密钥（最重要）
-
-1. 打开仓库页面 → 点 **Settings**
-2. 左侧菜单 → **Secrets and variables** → **Actions**
-3. 点 **New repository secret**，添加两个密钥：
-
-| Name | Secret（你的值） |
-|------|------------------|
-| `BOT_TOKEN` | `8844255366:AAHYnVDcNT5-Bw_EdLbZu_ff10wSTgeuie8` |
-| `CHAT_ID` | `8444551104` |
-
-### 第 4 步：立即测试
-
-1. 仓库页面 → 点 **Actions** 标签
-2. 左侧点 **经济学人 Telegram 推送**
-3. 点 **Run workflow** → 绿色 **Run workflow** 按钮
-4. 等待约 1-2 分钟，查看你的 Telegram！
+以后每期经济学人发布后，频道会自动推送 PDF + EPUB + MOBI + AZW3 + 封面，直接在 Telegram 里下载阅读。
 
 ---
 
-## ⏰ 自动运行时间
+## 自动运行时间
 
 - 每周六和周日早上 9:00（北京时间）
 - 经济学人通常周五/周六发布新刊
 
 ---
 
-## 📁 文件说明
+## 工作原理
+
+```
+evanbio/The_Economist 仓库更新
+        ↓
+GitHub Actions 定时检查
+        ↓
+发现有新期刊 → 下载所有格式
+        ↓
+推送到 Telegram 频道
+        ↓
+所有订阅者手机收到通知 📱
+```
+
+---
+
+## 自行部署
+
+想自己搭一个？Fork 这个仓库：
+
+### 前置准备
+1. 创建 Telegram Bot（@BotFather → `/newbot`）→ 拿到 Token
+2. 创建 Telegram 公开频道 → 把 Bot 加为管理员
+3. 拿到频道用户名（如 `@my_channel`）
+
+### 部署步骤
+1. 创建 GitHub 仓库，上传代码
+2. Settings → Secrets and variables → Actions → 添加两个密钥：
+
+| Name | Secret |
+|------|--------|
+| `BOT_TOKEN` | 你的 Bot Token |
+| `CHAT_ID` | 频道用户名（如 `@my_channel`） |
+
+3. Actions → 经济学人 Telegram 推送 → Run workflow
+
+---
+
+## 文件说明
 
 ```
 economist-telegram-bot/
@@ -75,6 +71,6 @@ economist-telegram-bot/
 └── README.md               # 本文件
 ```
 
-## 🛑 停止服务
+## 停止服务
 
-删除 GitHub 仓库即可停止所有自动推送。
+删除 GitHub 仓库即可。
