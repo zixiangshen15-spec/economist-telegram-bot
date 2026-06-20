@@ -1,6 +1,7 @@
 """
 经济学人 Telegram 推送 Bot
-监控 evanbio/The_Economist 仓库，有新期刊时自动推送到 Telegram
+监控 evanbio/The_Economist 仓库，有新期刊时自动推送到 Telegram 频道
+并自动维护置顶的往期合集目录
 """
 import os
 import sys
@@ -16,6 +17,7 @@ GITHUB_API = "https://api.github.com/repos/evanbio/The_Economist/contents"
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 RAW_BASE = "https://raw.githubusercontent.com/evanbio/The_Economist/main"
 STATE_FILE = "last_issue.txt"
+CATALOG_FILE = "catalog_msg_ids.txt"
 TELEGRAM_MAX_SIZE = 50 * 1024 * 1024  # Telegram Bot 文件上限 50MB
 
 # 需要下载和发送的文件格式（按优先级排序）
@@ -27,6 +29,8 @@ def log(msg):
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
 
 
+# ==================== GitHub API ====================
+
 def get_all_issue_dirs():
     """获取仓库中所有 TE-* 目录，返回按日期排序的列表"""
     log("正在获取仓库目录列表...")
@@ -36,28 +40,12 @@ def get_all_issue_dirs():
     dirs = []
     for item in resp.json():
         if item["type"] == "dir" and item["name"].startswith("TE-"):
-            # 解析日期: TE-2026-06-13 -> 2026-06-13
             date_str = item["name"].replace("TE-", "")
             dirs.append({"name": item["name"], "date": date_str})
 
     dirs.sort(key=lambda d: d["date"], reverse=True)
     log(f"找到 {len(dirs)} 期期刊，最新一期: {dirs[0]['name'] if dirs else '无'}")
     return dirs
-
-
-def get_last_processed():
-    """读取上次已处理的期刊日期"""
-    try:
-        with open(STATE_FILE, "r") as f:
-            return f.read().strip()
-    except FileNotFoundError:
-        return ""
-
-
-def save_last_processed(date_str):
-    """保存最新已处理的期刊日期"""
-    with open(STATE_FILE, "w") as f:
-        f.write(date_str)
 
 
 def get_issue_files(issue_name):
@@ -79,6 +67,25 @@ def get_issue_files(issue_name):
     return files
 
 
+# ==================== 状态管理 ====================
+
+def get_last_processed():
+    """读取上次已处理的期刊日期"""
+    try:
+        with open(STATE_FILE, "r") as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return ""
+
+
+def save_last_processed(date_str):
+    """保存最新已处理的期刊日期"""
+    with open(STATE_FILE, "w") as f:
+        f.write(date_str)
+
+
+# ==================== 文件下载 ====================
+
 def download_file(url, local_path):
     """下载文件到本地"""
     log(f"  下载中: {url.split('/')[-1]}")
@@ -93,6 +100,8 @@ def download_file(url, local_path):
     log(f"  下载完成: {size_mb:.1f} MB")
     return local_path
 
+
+# ==================== Telegram API ====================
 
 def send_to_telegram(method, files=None, data=None):
     """发送请求到 Telegram API"""
@@ -116,6 +125,7 @@ def send_message(text):
         "chat_id": CHAT_ID,
         "text": text,
         "parse_mode": "HTML",
+        "disable_web_page_preview": True,
     })
 
 
@@ -136,7 +146,6 @@ def send_document(filepath):
     filename = os.path.basename(filepath)
     file_size = os.path.getsize(filepath)
 
-    # 检查文件大小
     if file_size > TELEGRAM_MAX_SIZE:
         log(f"  文件 {filename} 超过 50MB，跳过发送")
         return None
@@ -148,6 +157,91 @@ def send_document(filepath):
         return send_to_telegram("sendDocument", files=files, data=data)
 
 
+# ==================== 置顶往期合集 ====================
+
+def generate_catalog_messages(issues):
+    """生成往期合集消息，自动拆分成多条（每条不超过 3500 字符）"""
+    header = (
+        "📚 <b>往期合集 · The Economist</b>\n"
+        "点击期刊日期 → 查看 PDF / EPUB / MOBI / AZW3\n"
+        f"🔗 <a href=\"https://t.me/the_econimist_weekly\">订阅频道</a>\n\n"
+    )
+
+    messages = []
+    current = header
+
+    for issue in issues:
+        date_str = issue["date"]
+        issue_name = issue["name"]
+        folder_url = f"https://github.com/evanbio/The_Economist/tree/main/{issue_name}"
+        line = f"📅 <b>{date_str}</b>  <a href=\"{folder_url}\">查看全部格式</a>\n"
+
+        if len(current) + len(line) > 3500:
+            messages.append(current)
+            current = line
+        else:
+            current += line
+
+    if current:
+        messages.append(current)
+
+    return messages
+
+
+def update_pinned_catalog(issues):
+    """更新置顶往期合集：发新消息 → 置顶 → 删除旧置顶"""
+    log("\n📋 更新往期合集...")
+
+    # 读取旧的置顶消息 ID
+    old_ids = []
+    if os.path.exists(CATALOG_FILE):
+        with open(CATALOG_FILE, "r") as f:
+            old_ids = [line.strip() for line in f if line.strip()]
+
+    # 生成并发送新合集
+    messages = generate_catalog_messages(issues)
+    new_ids = []
+
+    for i, text in enumerate(messages):
+        result = send_message(text)
+        if result.get("ok"):
+            msg_id = result["result"]["message_id"]
+            new_ids.append(str(msg_id))
+
+            # 置顶这条消息
+            pin_result = send_to_telegram("pinChatMessage", data={
+                "chat_id": CHAT_ID,
+                "message_id": msg_id,
+                "disable_notification": True,
+            })
+            if pin_result.get("ok"):
+                log(f"  合集第 {i+1}/{len(messages)} 页已置顶")
+            else:
+                log(f"  置顶失败: {pin_result}")
+        else:
+            log(f"  发送合集失败: {result}")
+
+    # 取消旧的置顶
+    for old_id in old_ids:
+        try:
+            send_to_telegram("unpinChatMessage", data={
+                "chat_id": CHAT_ID,
+                "message_id": int(old_id),
+            })
+        except Exception as e:
+            log(f"  取消旧置顶失败: {e}")
+
+    # 保存新的置顶消息 ID
+    new_id_count = len(new_ids)
+    with open(CATALOG_FILE, "w") as f:
+        f.write("\n".join(new_ids))
+
+    log(f"  往期合集更新完成 ({new_id_count} 条置顶消息)")
+    return True
+
+
+# ==================== 核心：处理新期刊 ====================
+
 def process_new_issue(issue):
     """处理新期刊：下载并发送所有文件"""
     issue_name = issue["name"]
@@ -157,20 +251,18 @@ def process_new_issue(issue):
     log(f"发现新期刊: {issue_name} (日期: {date_str})")
     log(f"{'='*60}")
 
-    # 获取该期所有文件
     files = get_issue_files(issue_name)
 
     if not files:
         log("  错误: 未找到任何文件")
         return False
 
-    # 创建临时目录
     tmpdir = Path(f"/tmp/{issue_name}")
     tmpdir.mkdir(parents=True, exist_ok=True)
 
     downloaded = []
 
-    # 下载所有文件
+    # 下载
     log(f"\n📥 下载文件 ({len(files)} 个)...")
     for ext in FORMATS:
         if ext in files:
@@ -186,11 +278,10 @@ def process_new_issue(issue):
         log("  错误: 所有文件下载失败")
         return False
 
-    # 先发封面图
+    # 发送封面
     log(f"\n📤 发送到 Telegram...")
     for ext, path in downloaded:
         if ext == "jpg":
-            # 发送封面，附带说明文字
             caption = (
                 f"📰 <b>The Economist</b>\n"
                 f"📅 <b>{date_str}</b>\n"
@@ -204,32 +295,30 @@ def process_new_issue(issue):
                 log(f"  发送封面失败: {e}")
             break
 
-    # 发送文档文件（PDF, EPUB, MOBI, AZW3）
+    # 发送文档
     format_emojis = {"pdf": "📕", "epub": "📗", "mobi": "📘", "azw3": "📙"}
     for ext, path in downloaded:
         if ext == "jpg":
-            continue  # 封面已发送
+            continue
 
         emoji = format_emojis.get(ext, "📄")
         file_size = os.path.getsize(path)
 
         try:
             if file_size > TELEGRAM_MAX_SIZE:
-                # 超过 50MB 上限，发送下载链接
                 link = files[ext]["download_url"]
                 send_message(f"{emoji} <b>{ext.upper()}</b> 文件过大，下载链接:\n{link}")
             else:
                 send_document(path)
         except Exception as e:
             log(f"  发送 {ext.upper()} 失败: {e}")
-            # 失败时发送下载链接作为后备
             link = files[ext]["download_url"]
             try:
                 send_message(f"{emoji} <b>{ext.upper()}</b> 发送失败，下载链接:\n{link}")
             except:
                 pass
 
-    # 发送汇总消息
+    # 发送汇总
     summary = (
         f"✅ <b>本期发送完毕</b>\n"
         f"📅 {date_str}\n"
@@ -240,7 +329,7 @@ def process_new_issue(issue):
     except:
         pass
 
-    # 清理临时文件
+    # 清理
     for _, path in downloaded:
         try:
             os.remove(path)
@@ -254,10 +343,11 @@ def process_new_issue(issue):
     return True
 
 
+# ==================== 主入口 ====================
+
 def main():
     log("🚀 经济学人 Telegram Bot 启动")
 
-    # 检查环境变量
     if not BOT_TOKEN or not CHAT_ID:
         log("错误: 请设置 BOT_TOKEN 和 CHAT_ID 环境变量")
         sys.exit(1)
@@ -279,42 +369,40 @@ def main():
     log(f"最新期刊: {latest['name']} ({latest['date']})")
     log(f"上次处理: {last_processed or '(首次运行)'}")
 
-    # 对比
+    # 对比，处理新期刊
     if latest["date"] == last_processed:
-        log("✅ 没有新期刊，无需操作")
-        sys.exit(0)
+        log("✅ 没有新期刊")
+    else:
+        new_issues = []
+        for issue in all_issues:
+            if issue["date"] > last_processed:
+                new_issues.append(issue)
+            else:
+                break
 
-    # 有新期刊——可能有多期（如果之前没运行过）
-    new_issues = []
-    for issue in all_issues:
-        if issue["date"] > last_processed:
-            new_issues.append(issue)
-        else:
-            break
+        log(f"\n共发现 {len(new_issues)} 期新期刊")
 
-    log(f"\n共发现 {len(new_issues)} 期新期刊")
+        if new_issues:
+            new_issues.reverse()  # 从旧到新
+            success_count = 0
+            for issue in new_issues:
+                try:
+                    if process_new_issue(issue):
+                        success_count += 1
+                except Exception as e:
+                    log(f"处理 {issue['name']} 时出错: {e}")
 
-    if not new_issues:
-        log("没有新期刊需要处理")
-        sys.exit(0)
+            save_last_processed(latest["date"])
+            log(f"\n任务完成: 成功处理 {success_count}/{len(new_issues)} 期")
 
-    # 从最旧到最新依次处理（这样在 Telegram 里顺序是正的）
-    new_issues.reverse()
-
-    success_count = 0
-    for issue in new_issues:
-        try:
-            if process_new_issue(issue):
-                success_count += 1
-        except Exception as e:
-            log(f"处理 {issue['name']} 时出错: {e}")
-            # 继续处理下一期
-
-    # 更新状态文件
-    save_last_processed(latest["date"])
+    # 无论有没有新期刊，都更新往期合集（保证置顶始终完整）
+    try:
+        update_pinned_catalog(all_issues)
+    except Exception as e:
+        log(f"更新往期合集失败: {e}")
 
     log(f"\n{'='*60}")
-    log(f"任务完成: 成功处理 {success_count}/{len(new_issues)} 期")
+    log("运行结束")
     log(f"{'='*60}")
 
 

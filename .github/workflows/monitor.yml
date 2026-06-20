@@ -37,10 +37,10 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add last_issue.txt
+          git add last_issue.txt catalog_msg_ids.txt
           if git diff --staged --quiet; then
             echo "状态文件无变化"
           else
-            git commit -m "update: last processed issue"
+            git commit -m "update: last processed issue & catalog"
             git push
           fi
