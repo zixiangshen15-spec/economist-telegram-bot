@@ -2,11 +2,15 @@ name: 经济学人 Telegram 推送
 
 on:
   schedule:
-    # 北京时间每周六早上 9:00 和每周日早上 9:00 (UTC+8)
+    # 北京时间每周六早上 9:07 和每周日早上 9:07 (UTC+8)
     # 经济学人通常周五/周六发布，双保险
-    - cron: '0 1 * * 6'
-    - cron: '0 1 * * 0'
+    - cron: '7 1 * * 6'
+    - cron: '7 1 * * 0'
   workflow_dispatch:  # 允许手动触发
+
+concurrency:
+  group: economist-monitor
+  cancel-in-progress: false  # 防止定时和手动运行并发推送、覆盖状态
 
 jobs:
   monitor:
@@ -26,18 +30,26 @@ jobs:
       - name: 安装依赖
         run: pip install -r requirements.txt
 
+      - name: 运行离线模拟测试
+        run: python -m unittest discover -s tests -v
+
       - name: 运行监控脚本
+        id: monitor
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: python monitor.py
 
       - name: 提交状态更新
-        if: success()
+        # 即使后续期刊/合集失败，也保存此前已发送成功的检查点；任务仍显示失败。
+        if: ${{ !cancelled() && steps.monitor.outcome != 'skipped' }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add last_issue.txt catalog_msg_ids.txt
+          for state in last_issue.txt catalog_msg_ids.txt source_state.txt; do
+            if [ -f "$state" ]; then git add -- "$state"; fi
+          done
           if git diff --staged --quiet; then
             echo "状态文件无变化"
           else

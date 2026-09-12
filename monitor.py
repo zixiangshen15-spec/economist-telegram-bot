@@ -1,26 +1,32 @@
 """
 经济学人 Telegram 推送 Bot
-监控 evanbio/The_Economist 仓库，有新期刊时自动推送到 Telegram 频道
+监控 hehonghui/awesome-english-ebooks 仓库，有新期刊时自动推送到 Telegram 频道
 并自动维护置顶的往期合集目录
 """
 import os
 import sys
-import json
+import re
+import tempfile
+from html import escape
+from urllib.parse import quote
 import requests
 from datetime import datetime
 from pathlib import Path
 
 # ==================== 配置 ====================
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-CHAT_ID = os.environ["CHAT_ID"]
-GITHUB_API = "https://api.github.com/repos/evanbio/The_Economist/contents"
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+CHAT_ID = os.environ.get("CHAT_ID", "")
+SOURCE_ID = "hehonghui/awesome-english-ebooks:master:01_economist"
+SOURCE_STATE_FILE = "source_state.txt"
+GITHUB_API = "https://api.github.com/repos/hehonghui/awesome-english-ebooks/contents/01_economist"
+SOURCE_URL = "https://github.com/hehonghui/awesome-english-ebooks/tree/master/01_economist"
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-RAW_BASE = "https://raw.githubusercontent.com/evanbio/The_Economist/main"
+RAW_BASE = "https://raw.githubusercontent.com/hehonghui/awesome-english-ebooks/master/01_economist"
 STATE_FILE = "last_issue.txt"
 CATALOG_FILE = "catalog_msg_ids.txt"
 TELEGRAM_MAX_SIZE = 50 * 1024 * 1024  # Telegram Bot 文件上限 50MB
 
-# 需要下载和发送的文件格式（按优先级排序）
+# 支持的格式白名单（按优先级排序）；只发送目录里实际存在的文件
 FORMATS = ["jpg", "pdf", "epub", "mobi", "azw3"]
 
 
@@ -31,57 +37,97 @@ def log(msg):
 
 # ==================== GitHub API ====================
 
-def get_all_issue_dirs():
-    """获取仓库中所有 TE-* 目录，返回按日期排序的列表"""
-    log("正在获取仓库目录列表...")
-    resp = requests.get(GITHUB_API, headers={"Accept": "application/vnd.github.v3+json"})
+def github_contents(path=""):
+    """只读取目录元数据；认证仅用于 GitHub API。"""
+    headers = {"Accept": "application/vnd.github+json"}
+    if os.environ.get("GITHUB_TOKEN"):
+        headers = {**headers, "Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}"}
+    resp = requests.get(f"{GITHUB_API}/{quote(path, safe='/')}",
+                        params={"ref": "master"}, headers=headers, timeout=30)
     resp.raise_for_status()
+    items = resp.json()
+    if not isinstance(items, list):
+        raise RuntimeError("来源异常：目录响应不是列表")
+    return items
 
-    dirs = []
-    for item in resp.json():
-        if item["type"] == "dir" and item["name"].startswith("TE-"):
-            date_str = item["name"].replace("TE-", "")
-            dirs.append({"name": item["name"], "date": date_str})
 
-    dirs.sort(key=lambda d: d["date"], reverse=True)
-    log(f"找到 {len(dirs)} 期期刊，最新一期: {dirs[0]['name'] if dirs else '无'}")
-    return dirs
+def get_all_issue_dirs():
+    """读取 te_YYYY.MM.DD 和年度归档，日期统一为 YYYY-MM-DD。"""
+    log("正在获取仓库目录列表...")
+    root = github_contents()
+    archives = [x.get("name", "") for x in root
+                if x.get("type") == "dir" and re.fullmatch(r"[0-9]{4}", x.get("name", ""))]
+    entries = [("", root)] + [(year, github_contents(year)) for year in archives]
+    dirs = {}
+    for prefix, items in entries:
+        for item in items:
+            name = item.get("name", "")
+            if item.get("type") != "dir" or not re.fullmatch(r"te_[0-9]{4}\.[0-9]{2}\.[0-9]{2}", name):
+                continue
+            try:
+                date = datetime.strptime(name[3:], "%Y.%m.%d").date().isoformat()
+            except ValueError:
+                continue
+            if date not in dirs:
+                dirs = {**dirs, date: {"name": f"{prefix}/{name}" if prefix else name, "date": date}}
+    issues = sorted(dirs.values(), key=lambda d: d["date"], reverse=True)
+    if not issues:
+        raise RuntimeError("来源异常：没有找到任何有效期刊目录")
+    log(f"找到 {len(issues)} 期期刊，最新一期: {issues[0]['name']}")
+    return issues
 
 
 def get_issue_files(issue_name):
-    """获取某一期期刊的所有文件信息"""
-    url = f"{GITHUB_API}/{issue_name}"
-    resp = requests.get(url, headers={"Accept": "application/vnd.github.v3+json"})
-    resp.raise_for_status()
-
+    """仅处理实际存在的支持格式，不把 README 或封面当成期刊。"""
     files = {}
-    for item in resp.json():
-        if item["type"] == "file":
-            ext = item["name"].split(".")[-1].lower()
-            if ext in FORMATS:
-                files[ext] = {
-                    "name": item["name"],
-                    "size": item["size"],
-                    "download_url": item["download_url"],
-                }
+    for item in github_contents(issue_name):
+        name = item.get("name", "")
+        ext = name.rsplit(".", 1)[-1].lower()
+        if item.get("type") != "file" or ext not in FORMATS:
+            continue
+        if (not name or "/" in name or "\\" in name or not item.get("download_url")
+                or not isinstance(item.get("size"), int) or item["size"] <= 0):
+            raise RuntimeError("来源异常：期刊文件元数据无效")
+        if ext in files:
+            raise RuntimeError(f"来源异常：同一期存在多个 {ext.upper()} 文件，需人工确认")
+        files = {**files, ext: {"name": name, "size": item["size"],
+                 "download_url": f"{RAW_BASE}/{quote(issue_name, safe='/')}/{quote(name, safe='')}"}}
+    if not any(ext != "jpg" for ext in files):
+        raise RuntimeError("来源异常：期刊目录没有有效电子书文件")
     return files
 
 
 # ==================== 状态管理 ====================
 
 def get_last_processed():
-    """读取上次已处理的期刊日期"""
+    """读取并校验原有去重记录；不清空、不回退。"""
     try:
-        with open(STATE_FILE, "r") as f:
-            return f.read().strip()
+        value = Path(STATE_FILE).read_text(encoding="utf-8").strip()
     except FileNotFoundError:
         return ""
+    try:
+        normalized = datetime.strptime(value, "%Y-%m-%d").date().isoformat() if value else ""
+    except ValueError:
+        normalized = ""
+    if value and (not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value) or normalized != value):
+        raise RuntimeError("状态日期无效，请检查 last_issue.txt")
+    return value
+
+
+def atomic_write(filename, content):
+    """同目录临时写入后原子替换，失败时保留旧文件。"""
+    target = Path(filename)
+    temporary = target.with_name(target.name + ".tmp")
+    try:
+        temporary.write_text(content, encoding="utf-8")
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def save_last_processed(date_str):
-    """保存最新已处理的期刊日期"""
-    with open(STATE_FILE, "w") as f:
-        f.write(date_str)
+    """仅在该期全部发送成功后调用。"""
+    atomic_write(STATE_FILE, date_str)
 
 
 # ==================== 文件下载 ====================
@@ -89,7 +135,7 @@ def save_last_processed(date_str):
 def download_file(url, local_path):
     """下载文件到本地"""
     log(f"  下载中: {url.split('/')[-1]}")
-    resp = requests.get(url, stream=True)
+    resp = requests.get(url, stream=True, timeout=120)
     resp.raise_for_status()
 
     with open(local_path, "wb") as f:
@@ -104,17 +150,19 @@ def download_file(url, local_path):
 # ==================== Telegram API ====================
 
 def send_to_telegram(method, files=None, data=None):
-    """发送请求到 Telegram API"""
+    """检查 HTTP 和 Telegram 结果；异常文本不暴露含 Token 的 URL。"""
     url = f"{TELEGRAM_API}/{method}"
-
-    if files:
-        resp = requests.post(url, data=data, files=files, timeout=120)
-    else:
-        resp = requests.post(url, json=data, timeout=30)
-
-    result = resp.json()
-    if not result.get("ok"):
-        log(f"  Telegram API 错误: {result}")
+    try:
+        if files:
+            resp = requests.post(url, data=data, files=files, timeout=120)
+        else:
+            resp = requests.post(url, json=data, timeout=30)
+        resp.raise_for_status()
+        result = resp.json()
+    except (requests.RequestException, ValueError):
+        raise RuntimeError(f"Telegram {method} 请求失败（网络、HTTP 或响应异常）") from None
+    if not isinstance(result, dict) or result.get("ok") is not True:
+        raise RuntimeError(f"Telegram {method} 返回失败")
     return result
 
 
@@ -147,8 +195,7 @@ def send_document(filepath):
     file_size = os.path.getsize(filepath)
 
     if file_size > TELEGRAM_MAX_SIZE:
-        log(f"  文件 {filename} 超过 50MB，跳过发送")
-        return None
+        raise RuntimeError("文件超过 Telegram 上传上限")
 
     log(f"发送文件: {filename} ({file_size / (1024*1024):.1f} MB)")
     with open(filepath, "rb") as f:
@@ -163,7 +210,7 @@ def generate_catalog_messages(issues):
     """生成往期合集消息，自动拆分成多条（每条不超过 3500 字符）"""
     header = (
         "📚 <b>往期合集 · The Economist</b>\n"
-        "点击期刊日期 → 查看 PDF / EPUB / MOBI / AZW3\n"
+        "点击期刊日期 → 查看来源实际提供的格式\n"
         f"🔗 <a href=\"https://t.me/the_econimist_weekly\">订阅频道</a>\n\n"
     )
 
@@ -173,7 +220,7 @@ def generate_catalog_messages(issues):
     for issue in issues:
         date_str = issue["date"]
         issue_name = issue["name"]
-        folder_url = f"https://github.com/evanbio/The_Economist/tree/main/{issue_name}"
+        folder_url = f"{SOURCE_URL}/{quote(issue_name, safe='/')}"
         line = f"📅 <b>{date_str}</b>  <a href=\"{folder_url}\">查看全部格式</a>\n"
 
         if len(current) + len(line) > 3500:
@@ -189,222 +236,106 @@ def generate_catalog_messages(issues):
 
 
 def update_pinned_catalog(issues):
-    """更新置顶往期合集：发新消息 → 置顶 → 删除旧置顶"""
-    log("\n📋 更新往期合集...")
-
-    # 读取旧的置顶消息 ID
-    old_ids = []
-    if os.path.exists(CATALOG_FILE):
-        with open(CATALOG_FILE, "r") as f:
-            old_ids = [line.strip() for line in f if line.strip()]
-
-    # 生成并发送新合集
-    messages = generate_catalog_messages(issues)
+    """全部新页置顶并保存后才取消旧页；失败保留旧合集及 ID。"""
+    log("更新往期合集...")
+    old_ids = (Path(CATALOG_FILE).read_text(encoding="utf-8").split()
+               if Path(CATALOG_FILE).exists() else [])
+    if any(not value.isdecimal() for value in old_ids):
+        raise RuntimeError("置顶消息 ID 状态无效")
     new_ids = []
-
-    for i, text in enumerate(messages):
+    for text in generate_catalog_messages(issues):
         result = send_message(text)
-        if result.get("ok"):
-            msg_id = result["result"]["message_id"]
-            new_ids.append(str(msg_id))
-
-            # 置顶这条消息
-            pin_result = send_to_telegram("pinChatMessage", data={
-                "chat_id": CHAT_ID,
-                "message_id": msg_id,
-                "disable_notification": True,
-            })
-            if pin_result.get("ok"):
-                log(f"  合集第 {i+1}/{len(messages)} 页已置顶")
-            else:
-                log(f"  置顶失败: {pin_result}")
-        else:
-            log(f"  发送合集失败: {result}")
-
-    # 取消旧的置顶
+        msg_id = result.get("result", {}).get("message_id")
+        if not isinstance(msg_id, int) or msg_id <= 0:
+            raise RuntimeError("Telegram 未返回有效消息 ID")
+        send_to_telegram("pinChatMessage", data={
+            "chat_id": CHAT_ID, "message_id": msg_id, "disable_notification": True})
+        new_ids = [*new_ids, str(msg_id)]
+    # 先保留新旧 ID；崩溃或取消置顶失败时仍能追踪旧页。
+    atomic_write(CATALOG_FILE, "\n".join([*new_ids, *old_ids]))
     for old_id in old_ids:
-        try:
-            send_to_telegram("unpinChatMessage", data={
-                "chat_id": CHAT_ID,
-                "message_id": int(old_id),
-            })
-        except Exception as e:
-            log(f"  取消旧置顶失败: {e}")
-
-    # 保存新的置顶消息 ID
-    new_id_count = len(new_ids)
-    with open(CATALOG_FILE, "w") as f:
-        f.write("\n".join(new_ids))
-
-    log(f"  往期合集更新完成 ({new_id_count} 条置顶消息)")
+        send_to_telegram("unpinChatMessage", data={"chat_id": CHAT_ID, "message_id": int(old_id)})
+    atomic_write(CATALOG_FILE, "\n".join(new_ids))
+    log(f"往期合集更新完成 ({len(new_ids)} 条置顶消息)")
     return True
 
 
 # ==================== 核心：处理新期刊 ====================
 
+def send_issue_files(issue, files, downloaded):
+    """任一发送失败即停止，绝不汇报整期成功。"""
+    formats = ", ".join(ext.upper() for ext in FORMATS if ext in files)
+    for ext, path in downloaded:
+        if ext == "jpg":
+            send_photo(path, caption=f"📰 <b>The Economist</b>\n📅 {issue['date']}\n本期格式: {formats}")
+        elif os.path.getsize(path) > TELEGRAM_MAX_SIZE:
+            link = escape(files[ext]["download_url"])
+            send_message(f"<b>{ext.upper()}</b> 文件过大，下载链接:\n{link}")
+        else:
+            send_document(path)
+    send_message(f"✅ <b>本期发送完毕</b>\n📅 {issue['date']}\n📂 包含格式: {formats}")
+
+
 def process_new_issue(issue):
-    """处理新期刊：下载并发送所有文件"""
-    issue_name = issue["name"]
-    date_str = issue["date"]
-
-    log(f"\n{'='*60}")
-    log(f"发现新期刊: {issue_name} (日期: {date_str})")
-    log(f"{'='*60}")
-
-    files = get_issue_files(issue_name)
-
-    if not files:
-        log("  错误: 未找到任何文件")
-        return False
-
-    tmpdir = Path(f"/tmp/{issue_name}")
-    tmpdir.mkdir(parents=True, exist_ok=True)
-
-    downloaded = []
-
-    # 下载
-    log(f"\n📥 下载文件 ({len(files)} 个)...")
-    for ext in FORMATS:
-        if ext in files:
+    """先完整下载，再逐个发送；异常交给主入口报告失败。"""
+    log(f"发现新期刊: {issue['name']} (日期: {issue['date']})")
+    files = get_issue_files(issue["name"])
+    with tempfile.TemporaryDirectory(prefix="economist-") as tmpdir:
+        downloaded = []
+        for ext in FORMATS:
+            if ext not in files:
+                continue
             info = files[ext]
-            local_path = tmpdir / info["name"]
-            try:
-                download_file(info["download_url"], local_path)
-                downloaded.append((ext, str(local_path)))
-            except Exception as e:
-                log(f"  下载失败 {info['name']}: {e}")
-
-    if not downloaded:
-        log("  错误: 所有文件下载失败")
-        return False
-
-    # 发送封面
-    log(f"\n📤 发送到 Telegram...")
-    for ext, path in downloaded:
-        if ext == "jpg":
-            caption = (
-                f"📰 <b>The Economist</b>\n"
-                f"📅 <b>{date_str}</b>\n"
-                f"🔗 <a href=\"https://t.me/the_econimist_weekly\">订阅频道</a>\n"
-                f"---\n"
-                f"正在发送 PDF + EPUB + MOBI + AZW3..."
-            )
-            try:
-                send_photo(path, caption=caption)
-            except Exception as e:
-                log(f"  发送封面失败: {e}")
-            break
-
-    # 发送文档
-    format_emojis = {"pdf": "📕", "epub": "📗", "mobi": "📘", "azw3": "📙"}
-    for ext, path in downloaded:
-        if ext == "jpg":
-            continue
-
-        emoji = format_emojis.get(ext, "📄")
-        file_size = os.path.getsize(path)
-
-        try:
-            if file_size > TELEGRAM_MAX_SIZE:
-                link = files[ext]["download_url"]
-                send_message(f"{emoji} <b>{ext.upper()}</b> 文件过大，下载链接:\n{link}")
-            else:
-                send_document(path)
-        except Exception as e:
-            log(f"  发送 {ext.upper()} 失败: {e}")
-            link = files[ext]["download_url"]
-            try:
-                send_message(f"{emoji} <b>{ext.upper()}</b> 发送失败，下载链接:\n{link}")
-            except:
-                pass
-
-    # 发送汇总
-    summary = (
-        f"✅ <b>本期发送完毕</b>\n"
-        f"📅 {date_str}\n"
-        f"📂 包含格式: {', '.join(f[0].upper() for f in downloaded)}"
-    )
-    try:
-        send_message(summary)
-    except:
-        pass
-
-    # 清理
-    for _, path in downloaded:
-        try:
-            os.remove(path)
-        except:
-            pass
-    try:
-        tmpdir.rmdir()
-    except:
-        pass
-
+            path = Path(tmpdir) / info["name"]
+            download_file(info["download_url"], path)
+            if path.stat().st_size != info["size"]:
+                raise RuntimeError("下载文件大小与来源元数据不符")
+            downloaded = [*downloaded, (ext, str(path))]
+        send_issue_files(issue, files, downloaded)
     return True
 
 
 # ==================== 主入口 ====================
 
+def select_new_issues(issues, last_processed, migrated):
+    """首次换源仅最新一期；后续按日期从旧到新处理未发送期刊。"""
+    newer = sorted((x for x in issues if x["date"] > last_processed), key=lambda x: x["date"])
+    return newer if migrated else newer[-1:]
+
+
 def main():
     log("🚀 经济学人 Telegram Bot 启动")
-
     if not BOT_TOKEN or not CHAT_ID:
         log("错误: 请设置 BOT_TOKEN 和 CHAT_ID 环境变量")
-        sys.exit(1)
-
-    # 获取所有期刊目录
+        return 1
     try:
         all_issues = get_all_issue_dirs()
-    except Exception as e:
-        log(f"获取目录失败: {e}")
-        sys.exit(1)
-
-    if not all_issues:
-        log("没有找到任何期刊，退出")
-        sys.exit(0)
-
-    latest = all_issues[0]
-    last_processed = get_last_processed()
-
-    log(f"最新期刊: {latest['name']} ({latest['date']})")
-    log(f"上次处理: {last_processed or '(首次运行)'}")
-
-    # 对比，处理新期刊
-    if latest["date"] == last_processed:
-        log("✅ 没有新期刊")
-    else:
-        new_issues = []
-        for issue in all_issues:
-            if issue["date"] > last_processed:
-                new_issues.append(issue)
-            else:
-                break
-
-        log(f"\n共发现 {len(new_issues)} 期新期刊")
-
-        if new_issues:
-            new_issues.reverse()  # 从旧到新
-            success_count = 0
-            for issue in new_issues:
-                try:
-                    if process_new_issue(issue):
-                        success_count += 1
-                except Exception as e:
-                    log(f"处理 {issue['name']} 时出错: {e}")
-
-            save_last_processed(latest["date"])
-            log(f"\n任务完成: 成功处理 {success_count}/{len(new_issues)} 期")
-
-    # 无论有没有新期刊，都更新往期合集（保证置顶始终完整）
-    try:
+        if not all_issues:
+            raise RuntimeError("来源异常：没有找到任何有效期刊")
+        last_processed = get_last_processed()
+        source_file = Path(SOURCE_STATE_FILE)
+        migrated = source_file.exists() and source_file.read_text(encoding="utf-8").strip() == SOURCE_ID
+        selected = select_new_issues(all_issues, last_processed, migrated)
+        if not migrated:
+            log("首次换源：仅处理最新一期，跳过历史积压，不清空原去重记录")
+        if not selected:
+            # 即使没有新日期，也检查最新目录仍含电子书，避免再次静默绿灯。
+            get_issue_files(all_issues[0]["name"])
+            log("没有新期刊")
+        for issue in selected:
+            if not process_new_issue(issue):
+                raise RuntimeError(f"期刊 {issue['date']} 发送失败")
+            save_last_processed(issue["date"])
+        if not migrated:
+            atomic_write(SOURCE_STATE_FILE, SOURCE_ID)
         update_pinned_catalog(all_issues)
-    except Exception as e:
-        log(f"更新往期合集失败: {e}")
-
-    log(f"\n{'='*60}")
+    except Exception as error:
+        message = str(error).replace(BOT_TOKEN, "[REDACTED]")
+        log(f"运行失败: {message}")
+        return 1
     log("运行结束")
-    log(f"{'='*60}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
